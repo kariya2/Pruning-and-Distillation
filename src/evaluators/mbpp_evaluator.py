@@ -4,7 +4,7 @@ import evaluate
 import torch
 from evaluators.base_evaluator import BaseEvaluator
 from itertools import islice
-
+from collections import defaultdict
 def group_by_n(lst, n):
     iterator = iter(lst)
     return list(iter(lambda: list(islice(iterator, n)), []))
@@ -95,11 +95,13 @@ def solution"""
             
         return results, completions_with_names
 
-    def run_evaluation(self, dataset, k: list = [1]) -> Dict[str, Any]:
+    def run_evaluation(self, dataset, k: list = [1], full=False) -> Dict[str, Any]:
         """Run evaluation on MBPP dataset using batches"""
-        results = []
+        results = defaultdict(int)
+        full_results = []
         total_passed = 0
         total_samples = 0
+        num_batches = 0
         
         for batch_idx, batch in enumerate(self.create_batches(dataset)):
             print(f"Processing batch {batch_idx+1}...")
@@ -120,13 +122,24 @@ def solution"""
                 #    #'test_results': eval_result['test_results']
                 #})
                 #total_passed += eval_results[1][i][0][1]['passed'] == 1.0
-            results.append(dict(results=eval_results, prompts=prompts,completion=completions))
+            for i in k:
+                results[f'pass@{i}'] += eval_results[0][f'pass@{i}']
+            num_batches += 1
+            if full:   
+                full_results.append(dict(results=eval_results, prompts=prompts,completion=completions))
             
             total_samples += len(batch)
-            break
-        return {
-            'results': results,
+        
+        for i in k:
+            results[f'pass@{i}'] /= num_batches
+
+        if full:
+            return {
+                'results': results,
+                'full_results': full_results,
             'total_samples': total_samples,
             'passed_samples': total_passed,
             'pass_rate': total_passed / total_samples
         }
+        else:
+            return results

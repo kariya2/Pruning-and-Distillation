@@ -105,7 +105,12 @@ def load_results(model_name: str = None, dataset_name: str = None,
 
 def main():
     # Load model and tokenizer
-    tokenizer, model = load_or_download_llama_model()
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    
+    # Load model and tokenizer
+    model_name = "Salesforce/codegen-2B-mono"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name)
     
     # Load MBPP dataset
     dataset = load_dataset("mbpp", split="test")
@@ -116,14 +121,15 @@ def main():
     
     # Run evaluation
     print("Running evaluation...")
-    results = evaluator.run_evaluation(simple_problems)
+    results = evaluator.run_evaluation(simple_problems, k=[1, 5, 10])
+    print(results)
     
     # Save results (you can use either method)
     # Method 1: Auto-incrementing run ID
-    save_results(results, "llama-3.2-1b", "mbpp_simple")
+    save_results(results, "codegen-2B-mono", "mbpp_simple")
     
     # Method 2: Custom name
-    # save_results(results, "llama-3.2-1b", "mbpp_simple", custom_name="baseline_run")
+    # save_results(results, "codegen-2B-mono", "mbpp_simple", custom_name="baseline_run")
     
     # Print summary
     print(f"\nEvaluation Summary:")
