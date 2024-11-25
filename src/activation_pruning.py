@@ -11,13 +11,15 @@ class ActivationBasedPruning:
         model: nn.Module,
         tokenizer,
         dataset,
-        aggregation_fn: Optional[Callable] = None
+        aggregation_fn: Optional[Callable] = None,
+        calibration_dataset_size: int = 1024
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.dataset = dataset
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.importance_scores = None
+        self.calibration_dataset_size = calibration_dataset_size
         
         # Default to L2 norm if no aggregation function specified
         self.aggregation_fn = aggregation_fn or self._l2_norm
@@ -47,36 +49,37 @@ def solution"""
             for sample in samples
         ]
     
-    def collect_activations(self, num_samples: int = 1024, batch_size: int = 8):
+    def collect_activations(self, batch_size: int = 8):
         """Collect activation statistics from forward passes."""
-        samples = self.dataset.select(range(min(num_samples, len(self.dataset))))
+        samples = self.dataset.select(range(min(self.calibration_dataset_size, len(self.dataset))))
         activation_stats = defaultdict(list)
         
         def hook_fn(layer_name: str):
             def hook(module, input, output):
-                if layer_name.startswith('attn'):
-                    # Extract just the tensor output, ignoring the cache
-                    attn_output = output[0] if isinstance(output, tuple) else output
+                if layer_name.startswith('mlp'):
+                    # Get activations after fc_in and activation
+                    intermediate_output = module.act(module.fc_in(input[0]))  # [batch, seq, 4096]
+                    # Aggregate across sequence length
+                    score = self.aggregation_fn(intermediate_output, dims=1)  # [batch, 4096]
+                    activation_stats[layer_name].append(score.detach().cpu())
+                else:  # attention head case remains the same
+                    if isinstance(output, tuple):
+                        attn_output = output[0]
+                    else:
+                        attn_output = output
                     B, S, D = attn_output.shape
-                    H = self.model.transformer.h[0].attn.num_attention_heads
+                    H = module.num_attention_heads
                     head_dim = D // H
                     attn_output = attn_output.view(B, S, H, head_dim)
-                    
-                    # Important: Aggregate across sequence length dimension first
-                    # This ensures our output only depends on batch and head dimensions
-                    score = self.aggregation_fn(attn_output, dims=(1, -1))  # (batch, num_heads)
-                    activation_stats[layer_name].append(score.detach().cpu())
-                else:
-                    # For MLP, aggregate across sequence length first as well
-                    score = self.aggregation_fn(output, dims=1)  # (batch, hidden_dim)
+                    score = self.aggregation_fn(attn_output, dims=(1, -1))
                     activation_stats[layer_name].append(score.detach().cpu())
             return hook
         
         # Register hooks
         hooks = []
         for idx, layer in enumerate(self.model.transformer.h):
-            hooks.append(layer.attn.register_forward_hook(hook_fn(f"attn_{idx}")))
-            hooks.append(layer.mlp.register_forward_hook(hook_fn(f"mlp_{idx}")))
+            hooks.append(layer.attn.register_forward_hook(hook_fn(f'attn_{idx}')))
+            hooks.append(layer.mlp.register_forward_hook(hook_fn(f'mlp_{idx}')))
         
         try:
             # Batch inference
@@ -149,18 +152,16 @@ def solution"""
         if 'neurons' in prune_specs:
             if prune_specs['neurons'] < 0:
                 raise ValueError("Cannot prune negative number of neurons")
-            hidden_dim = self.model.transformer.h[0].mlp.fc_in.weight.shape[0]
-            total_neurons = hidden_dim * len(self.model.transformer.h)
+            neurons_per_layer = self.model.transformer.h[0].mlp.fc_in.weight.shape[0]
+            total_neurons = neurons_per_layer * len(self.model.transformer.h)
             if prune_specs['neurons'] > total_neurons:
                 raise ValueError(f"Cannot prune {prune_specs['neurons']} neurons, only {total_neurons} available")
         
         pruned_components = {'heads': [], 'neurons': []}
         
-        # Prune attention heads
         if 'heads' in prune_specs:
             pruned_components['heads'] = self._prune_heads(prune_specs['heads'])
         
-        # Prune MLP neurons
         if 'neurons' in prune_specs:
             pruned_components['neurons'] = self._prune_neurons(prune_specs['neurons'])
         

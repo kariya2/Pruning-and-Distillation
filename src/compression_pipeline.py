@@ -156,7 +156,6 @@ class CompressionPipeline:
         )
         
         # Run pruning
-        pruner.importance_scores = pruner.compute_importance_scores()
         pruner.prune_model(prune_specs)
         
         # Evaluate and save results

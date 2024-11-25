@@ -106,7 +106,7 @@ class TestActivationPruning:
         
         # Test too many heads
         with pytest.raises(ValueError):
-            pruner.prune_model({'heads': 100})
+            pruner.prune_model({'heads': 1000})
         
         # Test too many neurons
         with pytest.raises(ValueError):
