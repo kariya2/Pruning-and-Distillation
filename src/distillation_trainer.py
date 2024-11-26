@@ -12,41 +12,87 @@ class DistillationTrainer(Trainer):
         self.alpha = alpha
         super().__init__(**kwargs)
         
-    def compute_loss(self, model, inputs, num_items_in_batch=None, return_outputs=False):
-        """
-        Compute distillation loss combining teacher and student outputs.
+    def _compute_kl_loss(self, student_logits, teacher_logits):
+        """Compute KL divergence loss with numerical stability checks"""
+        eps = 1e-7
         
-        Args:
-            model: The student model
-            inputs: The inputs to the model
-            num_items_in_batch: Number of items in batch (added to match parent signature)
-            return_outputs: Whether to return model outputs along with the loss
-        """
+        # Apply temperature scaling before adding epsilon
+        s_logits = student_logits / self.temperature
+        t_logits = teacher_logits / self.temperature
+        
+        # Add epsilon for numerical stability
+        s_logits = s_logits + eps
+        t_logits = t_logits + eps
+        
+        # Compute log softmax and softmax with dimension checks
+        log_softmax_student = F.log_softmax(s_logits, dim=-1)
+        softmax_teacher = F.softmax(t_logits, dim=-1)
+        
+        # Check for invalid values
+        if torch.isnan(log_softmax_student).any() or torch.isnan(softmax_teacher).any():
+            #import pdb; pdb.set_trace()
+            print("Warning: NaN values detected in logits")
+            # Clip or handle NaN values
+            log_softmax_student = torch.nan_to_num(log_softmax_student, nan=0.0)
+            softmax_teacher = torch.nan_to_num(softmax_teacher, nan=1.0/log_softmax_student.size(-1))
+        
+        # Compute KL divergence
+        loss_fct = torch.nn.KLDivLoss(reduction="batchmean")
+        kl_loss = loss_fct(log_softmax_student, softmax_teacher)
+        
+        # Scale loss by temperature
+        return kl_loss * (self.temperature ** 2)
+    
+    def compute_loss(self, model, inputs, num_items_in_batch=None, return_outputs=False):
+        """Compute combined distillation and task loss with detailed logging"""
         # Get student outputs
         outputs = model(**inputs)
         student_logits = outputs.logits
+        
+        # Check for NaNs immediately after forward pass
+        if torch.isnan(student_logits).any():
+            print("\nNaN detected in student logits immediately after forward pass!")
+            print(f"Input shape: {inputs['input_ids'].shape}")
+            print(f"Student logits shape: {student_logits.shape}")
+            
+            # Check each layer's output
+            print("\nChecking intermediate layer outputs:")
+            with torch.no_grad():
+                hidden_states = model.transformer(inputs['input_ids']).last_hidden_state
+                print(f"Transformer output shape: {hidden_states.shape}")
+                print(f"Transformer output has NaNs: {torch.isnan(hidden_states).any().item()}")
+                
+                # Check lm_head weights
+                print("\nChecking lm_head weights:")
+                print(f"Weight has NaNs: {torch.isnan(model.lm_head.weight).any().item()}")
+                if model.lm_head.bias is not None:
+                    print(f"Bias has NaNs: {torch.isnan(model.lm_head.bias).any().item()}")
+            
+            raise ValueError("NaN values detected in model outputs - stopping training")
         
         # Get teacher outputs
         with torch.no_grad():
             teacher_outputs = self.teacher_model(**inputs)
             teacher_logits = teacher_outputs.logits
             
-        # Compute distillation loss
-        loss_fct = torch.nn.KLDivLoss(reduction="batchmean")
-        distillation_loss = (
-            loss_fct(
-                torch.nn.functional.log_softmax(student_logits / self.temperature, dim=-1),
-                torch.nn.functional.softmax(teacher_logits / self.temperature, dim=-1)
-            )
-            * (self.temperature ** 2)
-        )
+            # Log teacher logits state
+            if torch.isnan(teacher_logits).any():
+                print("\nNaN detected in teacher logits:")
+                print(f"- NaN percentage: {torch.isnan(teacher_logits).float().mean() * 100:.2f}%")
         
-        # Compute standard loss
+        # Compute distillation loss
+        distillation_loss = self._compute_kl_loss(student_logits, teacher_logits)
+        
+        # Compute task loss if labels available
         if "labels" in inputs:
-            labels = inputs["labels"]
-            standard_loss = outputs.loss
-            # Combined loss
-            loss = self.alpha * standard_loss + (1 - self.alpha) * distillation_loss
+            task_loss = outputs.loss
+            
+            # Log task loss state
+            if torch.isnan(task_loss).any():
+                print("\nNaN detected in task loss")
+                task_loss = torch.zeros_like(task_loss)
+            
+            loss = self.alpha * task_loss + (1 - self.alpha) * distillation_loss
         else:
             loss = distillation_loss
         

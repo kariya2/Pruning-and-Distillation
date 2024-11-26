@@ -33,6 +33,7 @@ def setup_pruning(tiny_model, tiny_tokenizer, tiny_dataset):
     pruner = ActivationBasedPruning(
         model=tiny_model,
         tokenizer=tiny_tokenizer,
-        dataset=tiny_dataset
+        dataset=tiny_dataset,
+        calibration_dataset_size=4
     )
     return pruner 

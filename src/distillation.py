@@ -4,17 +4,30 @@ from distillation_trainer import DistillationTrainer
 from utils.mbpp_preprocessing import preprocess_mbpp_for_codegen
 
 def run_distillation(
-    model_name: str = "Salesforce/codegen-350M-mono",
+    teacher_model,
+    student_model,
+    tokenizer,
+    dataset=None,
     sample_size: int = 100,
     **kwargs
 ):
-    # Load models
-    tokenizer, teacher_model = load_model(model_name)
-    _, student_model = load_model(model_name)
+    """
+    Run knowledge distillation from teacher to student model.
     
-    # Load and preprocess dataset
-    raw_dataset = load_dataset("mbpp", split="train", sample_size=sample_size)
-    processed_dataset = preprocess_mbpp_for_codegen(raw_dataset, tokenizer)
+    Args:
+        teacher_model: The teacher model (previous stable model)
+        student_model: The student model (pruned model to be trained)
+        tokenizer: The tokenizer to use
+        dataset: Optional dataset (if not provided, will load MBPP)
+        sample_size: Number of samples to use if loading dataset
+        **kwargs: Additional training arguments
+    """
+    # Load dataset if not provided
+    if dataset is None:
+        dataset = load_dataset("mbpp", split="train", sample_size=sample_size)
+    
+    # Preprocess dataset
+    processed_dataset = preprocess_mbpp_for_codegen(dataset, tokenizer)
     
     # Setup training arguments
     training_args = TrainingArguments(
@@ -23,12 +36,14 @@ def run_distillation(
         per_device_train_batch_size=kwargs.get('batch_size', 4),
         learning_rate=kwargs.get('learning_rate', 1e-4),
         logging_steps=10,
+        save_strategy="no",  # Don't save checkpoints during training
+        report_to="none"  # Disable wandb/tensorboard logging
     )
     
     # Initialize trainer
     trainer = DistillationTrainer(
         teacher_model=teacher_model,
-        model=student_model,
+        model=student_model,  # student model is the main model
         args=training_args,
         train_dataset=processed_dataset,
         tokenizer=tokenizer,
@@ -36,5 +51,5 @@ def run_distillation(
         alpha=kwargs.get('alpha', 0.5)
     )
     
-    # Train
+    # Train and return results
     return trainer.train() 

@@ -4,11 +4,27 @@ from typing import Dict, Any, List, Union
 import torch
 from datetime import datetime
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Any
 
 from activation_pruning import ActivationBasedPruning
 from evaluators.mbpp_evaluator import MBPPEvaluator
-from data_loader import load_dataset
+from data_loader import load_dataset, load_model
+from distillation import run_distillation
 
+@dataclass
+class CompressionStep:
+    """Configuration for a single compression step"""
+    step_type: str  # 'prune' or 'distill'
+    config: Dict[str, Any]
+    
+@dataclass
+class CompressionResult:
+    """Results from a compression step"""
+    step_type: str
+    metrics: Dict[str, Any]
+    model_path: str
+    
 class CompressionPipeline:
     """Pipeline for iterative model compression experiments."""
     
@@ -16,28 +32,31 @@ class CompressionPipeline:
         self,
         model,
         tokenizer,
+        train_dataset,
+        eval_dataset,
+        evaluator,
         experiment_name: str,
+        model_name: str,
         base_output_dir: str = "experiments",
-        eval_dataset: str = "mbpp",
-        eval_split: str = "test",
-        eval_batch_size: int = 16,
-        eval_sample_size: int = None
     ):
-        """
-        Initialize compression pipeline.
+        """Initialize compression pipeline.
         
         Args:
             model: The model to compress
             tokenizer: Model tokenizer
+            train_dataset: Dataset for training/pruning
+            eval_dataset: Dataset for evaluation
+            evaluator: Evaluator instance
             experiment_name: Name for this experiment run
+            model_name: Name of the original model
             base_output_dir: Base directory for saving experiment results
-            eval_dataset: Dataset to use for evaluation
-            eval_split: Dataset split to use
-            eval_batch_size: Batch size for evaluation
-            eval_sample_size: Number of samples to use for evaluation (None for all)
         """
         self.model = model
+        self.model_name = model_name
         self.tokenizer = tokenizer
+        self.train_dataset = train_dataset
+        self.eval_dataset = eval_dataset
+        self.evaluator = evaluator
         
         # Setup experiment directories
         self.experiment_dir = self._setup_experiment_dir(base_output_dir, experiment_name)
@@ -46,12 +65,8 @@ class CompressionPipeline:
         self.checkpoints_dir.mkdir(exist_ok=True)
         self.results_dir.mkdir(exist_ok=True)
         
-        # Initialize evaluation components
-        self.eval_dataset = load_dataset(eval_dataset, split=eval_split, sample_size=eval_sample_size)
-        self.evaluator = MBPPEvaluator(model, tokenizer, batch_size=eval_batch_size)
-        
         # Track experiment history
-        self.history = []
+        self.results = []
         self.current_step = 0
         
     def _setup_experiment_dir(self, base_dir: str, experiment_name: str) -> Path:
@@ -102,7 +117,7 @@ class CompressionPipeline:
         state = {
             'step': self.current_step,
             'step_name': step_name,
-            'history': self.history
+            'results': self.results
         }
         with open(checkpoint_dir / "state.json", 'w') as f:
             json.dump(state, f, indent=2)
@@ -224,10 +239,214 @@ class CompressionPipeline:
             summary['steps'].append(step_summary)
         
         return summary
+    
+    def validate_loaded_model(self, model, model_path: str, model_type: str = "teacher"):
+        """Validate a loaded model's weights and outputs."""
+        print(f"\nValidating loaded {model_type} model from: {model_path}")
+        
+        # Check lm_head weights
+        lm_head = model.lm_head
+        weight = lm_head.weight.data
+        bias = lm_head.bias.data if lm_head.bias is not None else None
+        
+        print("\nLanguage model head statistics:")
+        print(f"Weight shape: {weight.shape}")
+        print(f"Weight range: [{weight.min():.4f}, {weight.max():.4f}]")
+        print(f"Weight mean: {weight.mean():.4f}")
+        print(f"NaN in weights: {torch.isnan(weight).any().item()}")
+        print(f"Inf in weights: {torch.isinf(weight).any().item()}")
+        
+        if bias is not None:
+            print(f"\nBias range: [{bias.min():.4f}, {bias.max():.4f}]")
+            print(f"Bias mean: {bias.mean():.4f}")
+            print(f"NaN in bias: {torch.isnan(bias).any().item()}")
+            print(f"Inf in bias: {torch.isinf(bias).any().item()}")
+        
+        # Test forward pass
+        sample_input = self.tokenizer(
+            "def test():",
+            return_tensors="pt",
+            truncation=True,
+            max_length=32
+        ).to(model.device)
+        
+        with torch.no_grad():
+            outputs = model(**sample_input)
+            logits = outputs.logits
+            
+        print("\nForward pass test:")
+        print(f"Output shape: {logits.shape}")
+        print(f"Output range: [{logits.min():.4f}, {logits.max():.4f}]")
+        print(f"Output mean: {logits.mean():.4f}")
+        print(f"NaN in output: {torch.isnan(logits).any().item()}")
+        print(f"Inf in output: {torch.isinf(logits).any().item()}")
+        
+        # Raise error if any problems found
+        if (torch.isnan(weight).any() or torch.isinf(weight).any() or 
+            (bias is not None and (torch.isnan(bias).any() or torch.isinf(bias).any()))):
+            raise ValueError(f"Loaded {model_type} model has corrupted weights")
+    
+    def run_step(self, step: CompressionStep, step_idx: int) -> CompressionResult:
+        """Run a single compression step"""
+        print(f"\n{'='*80}")
+        print(f"Starting step {step_idx}: {step.step_type}")
+        
+        if step.step_type == "prune":
+            # Pruning step - use current model
+            print(f"\nPruning Specifications:")
+            print(f"- Specs: {step.config['prune_spec']}")
+            pruner = ActivationBasedPruning(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                dataset=self.train_dataset,
+                **step.config.get("pruning_args", {})
+            )
+            metrics = pruner.prune_model(step.config["prune_spec"])
+            print("\nPruning complete")
+            self.validate_model_state("pruning")
+            
+        elif step.step_type == "distill":
+            # For distillation, we need to carefully manage teacher selection
+            if step_idx == 1:  # First distillation
+                # Load original model as teacher
+                print("\nLoading original model as teacher for first distillation")
+                teacher_model = type(self.model).from_pretrained(
+                    self.model_name,
+                    torch_dtype="auto",
+                    device_map="auto"
+                )
+            else:  # Subsequent distillations
+                # Use the last successful distilled model as teacher
+                last_distill = None
+                for prev_result in reversed(self.results):
+                    if prev_result.step_type == "distill":
+                        last_distill = prev_result
+                        break
+                
+                if last_distill is None:
+                    raise ValueError("No previous distilled model found for teacher")
+                
+                print(f"\nLoading previous distilled model as teacher from: {last_distill.model_path}")
+                teacher_model = type(self.model).from_pretrained(
+                    last_distill.model_path,
+                    torch_dtype="auto",
+                    device_map="auto"
+                )
+            
+            # Validate teacher model
+            self.validate_loaded_model(teacher_model, 
+                "original_model" if step_idx == 1 else last_distill.model_path, 
+                "teacher")
+            
+            # Run distillation
+            print("\nDistillation Configuration:")
+            print(f"- Teacher: {teacher_model.__class__.__name__}")
+            print(f"- Student: {self.model.__class__.__name__}")
+            print(f"- Config: {step.config}")
+            
+            metrics = run_distillation(
+                teacher_model=teacher_model,
+                student_model=self.model,
+                tokenizer=self.tokenizer,
+                dataset=self.train_dataset,
+                **step.config
+            )
+            print("\nDistillation complete")
+        
+        # Save model and results
+        step_dir = Path(self.experiment_dir) / f"step_{step_idx}"
+        step_dir.mkdir(exist_ok=True)
+        
+        model_path = str(step_dir / "model")
+        self.model.save_pretrained(model_path)
+        print(f"\nSaved model to: {model_path}")
+        
+        # Evaluate model after step
+        print("\nEvaluating model...")
+        eval_results = self.evaluator.run_evaluation(self.eval_dataset, k=[1, 5, 10])
+        
+        # Save checkpoint and results
+        self.save_checkpoint(f"{step.step_type}_{step_idx}")
+        
+        result = CompressionResult(
+            step_type=step.step_type,
+            metrics={
+                'step_metrics': metrics,
+                'eval_metrics': eval_results
+            },
+            model_path=model_path
+        )
+        
+        # Save step results
+        with open(step_dir / "results.json", "w") as f:
+            result_dict = {
+                "step": step_idx,
+                "step_type": step.step_type,
+                "config": step.config,
+                "metrics": metrics,
+                "eval_results": eval_results,
+                "model_path": model_path,
+                "timestamp": datetime.now().isoformat()
+            }
+            json.dump(result_dict, f, indent=2)
+        print(f"Saved results to: {step_dir / 'results.json'}")
+        
+        self.results.append(result)
+        self.current_step += 1
+        return result
+    
+    def run_pipeline(self, steps: List[CompressionStep]) -> List[CompressionResult]:
+        """Run full compression pipeline"""
+        for idx, step in enumerate(steps):
+            print(f"\nRunning {step.step_type} step {idx+1}/{len(steps)}")
+            self.run_step(step, idx)
+        return self.results
+    
+    def validate_model_state(self, step_name: str):
+        """Validate model weights and outputs after a compression step."""
+        print(f"\nValidating model state after {step_name}...")
+        
+        # Check lm_head weights
+        lm_head = self.model.lm_head
+        weight = lm_head.weight.data
+        bias = lm_head.bias.data if lm_head.bias is not None else None
+        
+        print("\nLanguage model head statistics:")
+        print(f"Weight shape: {weight.shape}")
+        print(f"Weight range: [{weight.min():.4f}, {weight.max():.4f}]")
+        print(f"Weight mean: {weight.mean():.4f}")
+        print(f"NaN in weights: {torch.isnan(weight).any().item()}")
+        print(f"Inf in weights: {torch.isinf(weight).any().item()}")
+        
+        if bias is not None:
+            print(f"\nBias range: [{bias.min():.4f}, {bias.max():.4f}]")
+            print(f"Bias mean: {bias.mean():.4f}")
+            print(f"NaN in bias: {torch.isnan(bias).any().item()}")
+            print(f"Inf in bias: {torch.isinf(bias).any().item()}")
+        
+        # Test forward pass
+        sample_input = self.tokenizer(
+            "def test():",
+            return_tensors="pt",
+            truncation=True,
+            max_length=32
+        ).to(self.model.device)
+        
+        with torch.no_grad():
+            outputs = self.model(**sample_input)
+            logits = outputs.logits
+            
+        print("\nForward pass test:")
+        print(f"Output shape: {logits.shape}")
+        print(f"Output range: [{logits.min():.4f}, {logits.max():.4f}]")
+        print(f"Output mean: {logits.mean():.4f}")
+        print(f"NaN in output: {torch.isnan(logits).any().item()}")
+        print(f"Inf in output: {torch.isinf(logits).any().item()}")
 
 def main():
     """Example usage of compression pipeline."""
-    from data_loader import load_model
+    from data_loader import load_model, load_dataset
+    from evaluators.mbpp_evaluator import MBPPEvaluator
     
     import os
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -236,47 +455,64 @@ def main():
     model_name = "Salesforce/codegen-350M-mono"
     tokenizer, model = load_model(model_name)
     
+    # Load datasets
+    train_dataset = load_dataset("mbpp", split="train")
+    eval_dataset = load_dataset("mbpp", split="test", sample_size=500).select(range(25))
+    
+    # Create evaluator
+    evaluator = MBPPEvaluator(
+        model=model,
+        tokenizer=tokenizer,
+        batch_size=16
+    )
+    
     # Initialize pipeline
     pipeline = CompressionPipeline(
         model=model,
+        model_name=model_name,
         tokenizer=tokenizer,
-        experiment_name="codegen350M_progressive_pruning",
-        eval_sample_size=500  # Increased for better evaluation
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        evaluator=evaluator,
+        experiment_name="codegen350M_prune_and_distill"
     )
     
-    # Progressive pruning schedule
-    pruning_schedule = [
-        # Round 1: Light pruning (10%)
-        {
-            'heads': 32,    # 10% of heads (320 total)
-            'neurons': 400,  # ~10% of neurons per layer
-            'embeddings': 0  # No embedding pruning initially
-        },
-        # Round 2: Moderate pruning (20%)
-        {
-            'heads': 64,    # 20% of heads
-            'neurons': 800,  # ~20% of neurons
-            'embeddings': 100  # Light embedding pruning
-        },
-        # Round 3: Aggressive pruning (30%)
-        {
-            'heads': 96,     # 30% of heads
-            'neurons': 1200,  # ~30% of neurons
-            'embeddings': 200 # Moderate embedding pruning
-        },
-        # Round 4: Final pruning (40%)
-        {
-            'heads': 128,    # 40% of heads
-            'neurons': 1600, # ~40% of neurons
-            'embeddings': 300 # Aggressive embedding pruning
-        }
+    # Define compression steps
+    steps = [
+        CompressionStep(
+            step_type="prune",
+            config={
+                "prune_spec": {
+                    'heads': 32,    # 10% of heads
+                    'neurons': 400,  # ~10% of neurons
+                },
+                "pruning_args": {
+                    "calibration_dataset_size": 8
+                }
+            }
+        ),
+        CompressionStep(
+            step_type="distill",
+            config={
+                "num_epochs": 3,           # Increase epochs
+                "learning_rate": 1e-5,     # Lower learning rate
+                "gradient_accumulation_steps": 4,  # Add gradient accumulation
+                "warmup_steps": 100,        # Add warmup
+                "max_length": 256,
+                "temperature": 1.0,
+                "alpha": 0.5,
+                "save_steps": 50,
+                "logging_steps": 10,
+                "max_grad_norm": 1.0,
+                "warmup_ratio": 0.1,
+                "weight_decay": 0.01,
+            }
+        )
+        # ... rest of steps ...
     ]
     
-    # Run pruning experiments with larger calibration set
-    results = pipeline.run_iterative_pruning(
-        prune_schedule=pruning_schedule,
-        calibration_size=256  # Increased for better calibration
-    )
+    # Use run_pipeline instead of run_iterative_pruning
+    results = pipeline.run_pipeline(steps)
     
     # Print final summary
     summary = pipeline.get_experiment_summary()

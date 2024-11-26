@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.utils.prune as prune
 from tqdm import tqdm
 import numpy as np
 from collections import defaultdict
@@ -168,11 +169,7 @@ def solution"""
         return pruned_components
     
     def _prune_heads(self, num_heads: int) -> List[Tuple[int, int]]:
-        """
-        Prune specified number of attention heads.
-        Returns:
-            List of (layer_idx, head_idx) tuples for pruned heads
-        """
+        """Prune specified number of attention heads."""
         head_scores = [
             (layer_idx, head_idx, score)
             for layer_idx, scores in self.importance_scores['heads'].items()
@@ -188,39 +185,43 @@ def solution"""
             start_idx = head_idx * head_size
             end_idx = start_idx + head_size
             
-            # Zero out Q, K, V sections
-            for offset in [0, head_size, 2 * head_size]:  # For Q, K, and V
+            # For QKV projection
+            qkv_weight = layer.attn.qkv_proj.weight
+            mask = torch.ones_like(qkv_weight, dtype=bool)
+            
+            # Zero out Q,K,V sections for this head
+            for offset in [0, head_size, 2 * head_size]:
                 start = start_idx + offset
                 end = end_idx + offset
+                mask[:, start:end] = 0
                 
-                # Create zeros with matching dtype and device
-                qkv_zeros = torch.zeros_like(
-                    layer.attn.qkv_proj.weight.data[:, start:end],
-                    dtype=layer.attn.qkv_proj.weight.dtype,
-                    device=layer.attn.qkv_proj.weight.device
-                )
-                
-                # Zero out the section
-                layer.attn.qkv_proj.weight.data[:, start:end] = qkv_zeros
-            
-            # Zero out output projection
-            out_zeros = torch.zeros_like(
-                layer.attn.out_proj.weight.data[start_idx:end_idx, :],
-                dtype=layer.attn.out_proj.weight.dtype,
-                device=layer.attn.out_proj.weight.device
+            prune.CustomFromMask.apply(
+                layer.attn.qkv_proj, 
+                'weight',
+                mask
             )
-            layer.attn.out_proj.weight.data[start_idx:end_idx, :] = out_zeros
+            
+            # For output projection
+            out_weight = layer.attn.out_proj.weight
+            mask = torch.ones_like(out_weight, dtype=bool)
+            mask[start_idx:end_idx, :] = 0
+            
+            prune.CustomFromMask.apply(
+                layer.attn.out_proj, 
+                'weight',
+                mask
+            )
+            
+            # Make pruning permanent
+            prune.remove(layer.attn.qkv_proj, 'weight')
+            prune.remove(layer.attn.out_proj, 'weight')
             
             pruned_heads.append((layer_idx, head_idx))
         
         return pruned_heads
     
     def _prune_neurons(self, num_neurons: int) -> List[Tuple[int, int]]:
-        """
-        Prune specified number of MLP neurons.
-        Returns:
-            List of (layer_idx, neuron_idx) tuples for pruned neurons
-        """
+        """Prune specified number of MLP neurons using PyTorch pruning primitives."""
         neuron_scores = [
             (layer_idx, neuron_idx, score)
             for layer_idx, scores in self.importance_scores['neurons'].items()
@@ -232,8 +233,22 @@ def solution"""
         
         for layer_idx, neuron_idx, _ in neuron_scores[:num_neurons]:
             layer = self.model.transformer.h[layer_idx].mlp
-            layer.fc_in.weight.data[neuron_idx, :] = 0
-            layer.fc_out.weight.data[:, neuron_idx] = 0
+            
+            # Create mask for input weights (1s for weights to keep, 0s for weights to prune)
+            in_mask = torch.ones_like(layer.fc_in.weight, dtype=bool)
+            in_mask[neuron_idx, :] = 0  # Prune the neuron's input weights
+            
+            # Create mask for output weights
+            out_mask = torch.ones_like(layer.fc_out.weight, dtype=bool)
+            out_mask[:, neuron_idx] = 0  # Prune the neuron's output weights
+            
+            # Apply masks using CustomFromMask
+            prune.CustomFromMask.apply(layer.fc_in, 'weight', in_mask)
+            prune.CustomFromMask.apply(layer.fc_out, 'weight', out_mask)
+            
+            # Make pruning permanent
+            prune.remove(layer.fc_in, 'weight')
+            prune.remove(layer.fc_out, 'weight')
             
             pruned_neurons.append((layer_idx, neuron_idx))
         
