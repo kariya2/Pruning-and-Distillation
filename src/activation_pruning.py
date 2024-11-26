@@ -213,8 +213,6 @@ def solution"""
             )
             
             # Make pruning permanent
-            prune.remove(layer.attn.qkv_proj, 'weight')
-            prune.remove(layer.attn.out_proj, 'weight')
             
             pruned_heads.append((layer_idx, head_idx))
         
@@ -245,10 +243,6 @@ def solution"""
             # Apply masks using CustomFromMask
             prune.CustomFromMask.apply(layer.fc_in, 'weight', in_mask)
             prune.CustomFromMask.apply(layer.fc_out, 'weight', out_mask)
-            
-            # Make pruning permanent
-            prune.remove(layer.fc_in, 'weight')
-            prune.remove(layer.fc_out, 'weight')
             
             pruned_neurons.append((layer_idx, neuron_idx))
         
