@@ -3,6 +3,48 @@ import torch
 import torch.nn.functional as F
 from typing import Dict, Any, Optional, Union
 
+def validate_model_state(model, tokenizer):
+        """Validate model weights and outputs after a compression step."""
+
+        print("We HERE")
+        
+        # Check lm_head weights
+        lm_head = model.lm_head
+        weight = lm_head.weight.data
+        bias = lm_head.bias.data if lm_head.bias is not None else None
+        
+        print("\nLanguage model head statistics:")
+        print(f"Weight shape: {weight.shape}")
+        print(f"Weight range: [{weight.min():.4f}, {weight.max():.4f}]")
+        print(f"Weight mean: {weight.mean():.4f}")
+        print(f"NaN in weights: {torch.isnan(weight).any().item()}")
+        print(f"Inf in weights: {torch.isinf(weight).any().item()}")
+        
+        if bias is not None:
+            print(f"\nBias range: [{bias.min():.4f}, {bias.max():.4f}]")
+            print(f"Bias mean: {bias.mean():.4f}")
+            print(f"NaN in bias: {torch.isnan(bias).any().item()}")
+            print(f"Inf in bias: {torch.isinf(bias).any().item()}")
+        
+        # Test forward pass
+        sample_input = tokenizer(
+            "def test():",
+            return_tensors="pt",
+            truncation=True,
+            max_length=32
+        ).to(model.device)
+        
+        with torch.no_grad():
+            outputs = model(**sample_input)
+            logits = outputs.logits
+            
+        print("\nForward pass test:")
+        print(f"Output shape: {logits.shape}")
+        print(f"Output range: [{logits.min():.4f}, {logits.max():.4f}]")
+        print(f"Output mean: {logits.mean():.4f}")
+        print(f"NaN in output: {torch.isnan(logits).any().item()}")
+        print(f"Inf in output: {torch.isinf(logits).any().item()}")
+
 class DistillationTrainer(Trainer):
     """Extends HuggingFace Trainer for knowledge distillation"""
     
@@ -16,13 +58,13 @@ class DistillationTrainer(Trainer):
         """Compute KL divergence loss with numerical stability checks"""
         eps = 1e-7
         
-        # Apply temperature scaling before adding epsilon
-        s_logits = student_logits / self.temperature
+        # Scale logits before softmax but don't multiply final loss by T^2
+        s_logits = student_logits / self.temperature 
         t_logits = teacher_logits / self.temperature
         
         # Add epsilon for numerical stability
-        s_logits = s_logits + eps
-        t_logits = t_logits + eps
+        s_logits = torch.clamp(s_logits, min=-100, max=100)  # Add clipping
+        t_logits = torch.clamp(t_logits, min=-100, max=100)  # Add clipping
         
         # Compute log softmax and softmax with dimension checks
         log_softmax_student = F.log_softmax(s_logits, dim=-1)
@@ -30,22 +72,18 @@ class DistillationTrainer(Trainer):
         
         # Check for invalid values
         if torch.isnan(log_softmax_student).any() or torch.isnan(softmax_teacher).any():
-            #import pdb; pdb.set_trace()
             print("Warning: NaN values detected in logits")
-            # Clip or handle NaN values
             log_softmax_student = torch.nan_to_num(log_softmax_student, nan=0.0)
             softmax_teacher = torch.nan_to_num(softmax_teacher, nan=1.0/log_softmax_student.size(-1))
         
-        # Compute KL divergence
+        # Compute KL divergence without the temperature scaling
         loss_fct = torch.nn.KLDivLoss(reduction="batchmean")
-        kl_loss = loss_fct(log_softmax_student, softmax_teacher)
-        
-        # Scale loss by temperature
-        return kl_loss * (self.temperature ** 2)
+        return loss_fct(log_softmax_student, softmax_teacher)
     
     def compute_loss(self, model, inputs, num_items_in_batch=None, return_outputs=False):
         """Compute combined distillation and task loss with detailed logging"""
         # Get student outputs
+        #validate_model_state(model, self.tokenizer)
         outputs = model(**inputs)
         student_logits = outputs.logits
         

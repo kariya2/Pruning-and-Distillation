@@ -29,15 +29,21 @@ def run_distillation(
     # Preprocess dataset
     processed_dataset = preprocess_mbpp_for_codegen(dataset, tokenizer)
     
-    # Setup training arguments
+    # Setup training arguments with all kwargs
     training_args = TrainingArguments(
         output_dir="./distillation_output",
         num_train_epochs=kwargs.get('num_epochs', 2),
         per_device_train_batch_size=kwargs.get('batch_size', 4),
         learning_rate=kwargs.get('learning_rate', 1e-4),
-        logging_steps=10,
-        save_strategy="no",  # Don't save checkpoints during training
-        report_to="none"  # Disable wandb/tensorboard logging
+        logging_steps=kwargs.get('logging_steps', 10),
+        save_strategy="no",
+        report_to="none",
+        max_grad_norm=kwargs.get('max_grad_norm', 1.0),
+        gradient_accumulation_steps=kwargs.get('gradient_accumulation_steps', 1),
+        warmup_steps=kwargs.get('warmup_steps', 0),
+        warmup_ratio=kwargs.get('warmup_ratio', 0.0),
+        weight_decay=kwargs.get('weight_decay', 0.0),
+        save_steps=kwargs.get('save_steps', 500),
     )
     
     # Initialize trainer

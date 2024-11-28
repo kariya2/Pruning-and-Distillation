@@ -303,7 +303,7 @@ class CompressionPipeline:
             )
             metrics = pruner.prune_model(step.config["prune_spec"])
             print("\nPruning complete")
-            self.validate_model_state("pruning")
+            #self.validate_model_state("pruning")
             
         elif step.step_type == "distill":
             # For distillation, we need to carefully manage teacher selection
@@ -344,6 +344,7 @@ class CompressionPipeline:
             print(f"- Student: {self.model.__class__.__name__}")
             print(f"- Config: {step.config}")
             
+            #self.validate_model_state("right before distillation")
             metrics = run_distillation(
                 teacher_model=teacher_model,
                 student_model=self.model,
