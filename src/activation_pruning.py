@@ -220,30 +220,59 @@ def solution"""
     
     def _prune_neurons(self, num_neurons: int) -> List[Tuple[int, int]]:
         """Prune specified number of MLP neurons using PyTorch pruning primitives."""
+        # Get and sort all neurons by importance score
         neuron_scores = [
             (layer_idx, neuron_idx, score)
             for layer_idx, scores in self.importance_scores['neurons'].items()
             for neuron_idx, score in enumerate(scores)
         ]
+        neuron_scores.sort(key=lambda x: x[2])  # Sort by importance score
         
-        neuron_scores.sort(key=lambda x: x[2])
+        # Take only the number we want to prune
+        neurons_to_prune = neuron_scores[:num_neurons]
+        
+        # Group by layer while preserving order
+        layer_neurons = defaultdict(list)
+        for layer_idx, neuron_idx, _ in neurons_to_prune:
+            layer_neurons[layer_idx].append(neuron_idx)
+        
         pruned_neurons = []
         
-        for layer_idx, neuron_idx, _ in neuron_scores[:num_neurons]:
+        # Process each layer
+        for layer_idx, neuron_indices in layer_neurons.items():
             layer = self.model.transformer.h[layer_idx].mlp
             
-            # Create mask for input weights (1s for weights to keep, 0s for weights to prune)
-            in_mask = torch.ones_like(layer.fc_in.weight, dtype=bool)
-            in_mask[neuron_idx, :] = 0  # Prune the neuron's input weights
+            # Create masks on same device as layer
+            in_mask = torch.ones_like(layer.fc_in.weight, dtype=bool, device=layer.fc_in.weight.device)
+            out_mask = torch.ones_like(layer.fc_out.weight, dtype=bool, device=layer.fc_out.weight.device)
             
-            # Create mask for output weights
-            out_mask = torch.ones_like(layer.fc_out.weight, dtype=bool)
-            out_mask[:, neuron_idx] = 0  # Prune the neuron's output weights
+            # Mark all neurons in this layer for pruning
+            for neuron_idx in neuron_indices:
+                in_mask[neuron_idx, :] = 0
+                out_mask[:, neuron_idx] = 0
             
-            # Apply masks using CustomFromMask
-            prune.CustomFromMask.apply(layer.fc_in, 'weight', in_mask)
-            prune.CustomFromMask.apply(layer.fc_out, 'weight', out_mask)
+            try:
+                # Apply masks
+                prune.CustomFromMask.apply(layer.fc_in, 'weight', in_mask)
+                prune.CustomFromMask.apply(layer.fc_out, 'weight', out_mask)
+                
+                # Record successfully pruned neurons
+                pruned_neurons.extend((layer_idx, n_idx) for n_idx in neuron_indices)
+                
+            except Exception as e:
+                print(f"Error pruning layer {layer_idx}: {str(e)}")
+                # Optionally handle error or re-raise
+                raise
             
-            pruned_neurons.append((layer_idx, neuron_idx))
+            finally:
+                # Clean up masks
+                del in_mask, out_mask
+                torch.cuda.empty_cache()
+        
+        # Verify we pruned the expected number
+        if len(pruned_neurons) != num_neurons:
+            raise ValueError(
+                f"Expected to prune {num_neurons} neurons but actually pruned {len(pruned_neurons)}"
+            )
         
         return pruned_neurons
