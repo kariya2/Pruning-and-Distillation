@@ -103,33 +103,39 @@ def load_results(model_name: str = None, dataset_name: str = None,
             results.append(json.load(f))
     return results
 
+def evaluate_model(model, test_dataset, tokenizer, batch_size=1):
+    total_batches = len(test_dataset) // batch_size
+    print(f"\nTotal evaluation batches: {total_batches}")
+    
+    # Rest of evaluation code...
+
 def main():
     # Load model and tokenizer
     from transformers import AutoModelForCausalLM, AutoTokenizer
     
     # Load model and tokenizer
-    model_name = "Salesforce/codegen-2B-mono"
+    model_name = "Salesforce/codegen-350M-mono"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(model_name)
     
     # Load MBPP dataset
     dataset = load_dataset("mbpp", split="test")
-    simple_problems = filter_simple_problems(dataset)
+    #simple_problems = filter_simple_problems(dataset)
     
     # Initialize evaluator
-    evaluator = MBPPEvaluator(model, tokenizer)
+    evaluator = MBPPEvaluator(model, tokenizer, batch_size=16)
     
     # Run evaluation
     print("Running evaluation...")
-    results = evaluator.run_evaluation(simple_problems, k=[1, 5, 10])
+    results = evaluator.run_evaluation(dataset, k=[1, 5, 10])
     print(results)
     
     # Save results (you can use either method)
     # Method 1: Auto-incrementing run ID
-    save_results(results, "codegen-2B-mono", "mbpp_simple")
+    save_results(results, "codegen-350M-mono", "mbpp")
     
     # Method 2: Custom name
-    # save_results(results, "codegen-2B-mono", "mbpp_simple", custom_name="baseline_run")
+    # save_results(results, "codegen-350M-mono", "mbpp", custom_name="baseline_run")
     
     # Print summary
     print(f"\nEvaluation Summary:")

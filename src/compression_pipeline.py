@@ -551,12 +551,12 @@ def main():
     os.environ["HF_ALLOW_CODE_EVAL"] = "1"
 
     # Load model with memory optimizations
-    model_name = "Salesforce/codegen-2B-mono"
+    model_name = "Salesforce/codegen-350M-mono"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float16,  # Use fp16
-        device_map="auto",
+        device_map="cuda",
     )
     
     # Get model config for compression schedule
@@ -578,7 +578,7 @@ def main():
     evaluator = MBPPEvaluator(
         model=model,
         tokenizer=tokenizer,
-        batch_size=4  # Reduced from 8
+        batch_size=16  # Reduced from 8
     )
     
     # Initialize pipeline
@@ -589,7 +589,7 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         evaluator=evaluator,
-        experiment_name="codegen2B_prune_and_distill_simple"
+        experiment_name="codegen350M_prune_and_distill_simple"
     )
     
     # Create compression schedule

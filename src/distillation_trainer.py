@@ -262,17 +262,17 @@ class DistillationTrainer(Trainer):
         }, f'nan_debug_{stage}.pt')
     
     def create_optimizer(self):
-        """Override to create AdamW optimizer with standard settings."""
+        """Override to create AdamW optimizer with better settings."""
         decay_parameters = self.get_decay_parameter_names(self.model)
         optimizer_grouped_parameters = [
             {
-                "params": [p for n, p in self.model.named_parameters()
-                           if n in decay_parameters and p.requires_grad],
+                "params": [p for n, p in self.model.named_parameters() 
+                          if n in decay_parameters and p.requires_grad],
                 "weight_decay": self.args.weight_decay,
             },
             {
-                "params": [p for n, p in self.model.named_parameters()
-                           if n not in decay_parameters and p.requires_grad],
+                "params": [p for n, p in self.model.named_parameters() 
+                          if n not in decay_parameters and p.requires_grad],
                 "weight_decay": 0.0,
             },
         ]
@@ -280,12 +280,12 @@ class DistillationTrainer(Trainer):
         from torch.optim import AdamW
         optimizer_cls = AdamW
         
-        # Start with 10% of target learning rate
-        initial_lr = self.args.learning_rate * 0.1
+        # Increase base learning rate
+        initial_lr = 5e-5  # Increased from 1e-5
         
         optimizer_kwargs = {
-            "lr": initial_lr,  # Start with non-zero learning rate
-            "betas": (0.9, 0.999),  # Standard momentum
+            "lr": initial_lr,
+            "betas": (0.9, 0.999),
             "eps": 1e-8,
         }
 
@@ -294,18 +294,14 @@ class DistillationTrainer(Trainer):
             **optimizer_kwargs
         )
 
-        # Keep the learning rate scheduler
-        num_training_steps = self.args.num_train_epochs * len(self.train_dataset) // self.args.train_batch_size
-        num_warmup_steps = min(1000, num_training_steps // 10)
+        # Adjust warmup and schedule
+        num_training_steps = self.args.num_train_epochs * len(self.train_dataset) // (self.args.train_batch_size * self.args.gradient_accumulation_steps)
+        num_warmup_steps = min(1000, num_training_steps // 10)  # Use fixed warmup steps instead of ratio
 
         self.lr_scheduler = get_cosine_schedule_with_warmup(
             self.optimizer,
             num_warmup_steps=num_warmup_steps,
             num_training_steps=num_training_steps
         )
-
-        # Initialize NaN debugger after optimizer but before any steps
-        from nan_debugger import NaNTransitionDebugger
-        #self.nan_debugger = NaNTransitionDebugger(self.model, self.optimizer)
 
         return self.optimizer
